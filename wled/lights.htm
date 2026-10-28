@@ -1,0 +1,177 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>LED Wall</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 12px; background: #111; color: #eee; font: 15px system-ui, sans-serif; }
+  #wall { display: block; height: 62vh; max-width: 100%; margin: 0 auto 10px; image-rendering: pixelated;
+          background: #000; touch-action: none; border: 1px solid #333; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  button { flex: 1; padding: 10px; font-size: 15px; border-radius: 8px; border: 1px solid #444; background: #222; color: #eee; }
+  button.on { background: #2a5bd7; border-color: #2a5bd7; }
+  input[type=range] { flex: 1; }
+  #status { font-size: 13px; color: #999; }
+</style>
+</head>
+<body>
+<canvas id="wall"></canvas>
+<div class="row">
+  <button data-mode="test">Wiring test</button>
+  <button data-mode="plasma">Plasma</button>
+  <button data-mode="paint">Paint</button>
+</div>
+<div class="row" id="testRow">LED # <input id="idx" type="range" min="0" value="0"> <span id="idxLabel">0</span></div>
+<div class="row" id="paintRow"><input id="color" type="color" value="#ff3080"> <button id="clear">Clear</button></div>
+<div class="row">Brightness <input id="bri" type="range" min="5" max="100" value="40"></div>
+<div id="status">connecting…</div>
+
+<script>
+// ---- Wall geometry --------------------------------------------------------
+const W = 37, H = 74, N = W * H;
+
+// Physical wiring, in the order the data flows. Each segment covers `rows`
+// consecutive rows; `startRight` says which side its first row starts on.
+// Rows snake (serpentine) within a segment. Use "Wiring test" to check this.
+const SEGMENTS = [
+  { rows: 19, startRight: false },
+  { rows: 18, startRight: false },
+  { rows: 19, startRight: false },
+  { rows: 18, startRight: false },
+];
+
+// map[led] = pixel index (y * W + x) on the canvas
+function buildLedMap() {
+  const map = [];
+  let y0 = 0;
+  for (const seg of SEGMENTS) {
+    for (let r = 0; r < seg.rows; r++) {
+      const y = y0 + r;
+      const rtl = (r % 2 === 1) !== seg.startRight;
+      for (let c = 0; c < W; c++) map.push(y * W + (rtl ? W - 1 - c : c));
+    }
+    y0 += seg.rows;
+  }
+  if (map.length !== N) console.warn(`SEGMENTS cover ${map.length} LEDs, expected ${N}`);
+  return map;
+}
+const ledMap = buildLedMap();
+
+// ---- WLED connection (DDP over WebSocket, WLED 16+) -----------------------
+const host = new URLSearchParams(location.search).get('host') || location.host || 'wled-032080.local';
+const statusEl = document.getElementById('status');
+let ws;
+
+function connect() {
+  ws = new WebSocket(`ws://${host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => statusEl.textContent = `connected to ${host}`;
+  ws.onclose = () => { statusEl.textContent = `disconnected from ${host}, retrying…`; setTimeout(connect, 1000); };
+  ws.onmessage = () => {}; // WLED broadcasts state JSON; not needed here
+}
+connect();
+
+// Sends one frame of RGB bytes in LED order. WLED takes at most 472 RGB pixels
+// per WebSocket message: 1 byte protocol id (0x02 = DDP) + 10 byte DDP header.
+const MAX_PX = 472;
+function sendFrame(rgb) {
+  if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 16384) return; // drop frame if backed up
+  for (let px = 0; px < N; px += MAX_PX) {
+    const count = Math.min(MAX_PX, N - px), off = px * 3, len = count * 3;
+    const pkt = new Uint8Array(11 + len);
+    pkt[0] = 0x02;                                   // WLED websocket: DDP
+    pkt[1] = px + count >= N ? 0x41 : 0x40;          // push (render) on last chunk
+    pkt[3] = 0x0B;                                   // RGB, 8 bit
+    pkt[4] = 0x01;                                   // default output
+    pkt[5] = off >>> 24; pkt[6] = off >>> 16; pkt[7] = off >>> 8; pkt[8] = off;
+    pkt[9] = len >>> 8; pkt[10] = len;
+    pkt.set(rgb.subarray(off, off + len), 11);
+    ws.send(pkt);
+  }
+}
+
+// ---- Drawing --------------------------------------------------------------
+const canvas = document.getElementById('wall');
+canvas.width = W; canvas.height = H;
+const ctx = canvas.getContext('2d');
+const img = ctx.createImageData(W, H);  // what the wall should look like, RGBA
+const paint = new Uint8ClampedArray(N * 4);
+const out = new Uint8Array(N * 3);      // LED order, RGB
+
+let mode = 'plasma';
+const idx = document.getElementById('idx'), idxLabel = document.getElementById('idxLabel');
+idx.max = N - 1;
+idx.oninput = () => idxLabel.textContent = idx.value;
+
+function setPixel(buf, p, r, g, b) { buf[p*4] = r; buf[p*4+1] = g; buf[p*4+2] = b; buf[p*4+3] = 255; }
+
+function render(t) {
+  const d = img.data;
+  if (mode === 'plasma') {
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const v = Math.sin(x / 5 + t) + Math.sin(y / 7 - t * 0.7) + Math.sin((x + y) / 9 + t * 0.5);
+      setPixel(d, y * W + x, 128 + 127 * Math.sin(v * 2), 128 + 127 * Math.sin(v * 2 + 2), 128 + 127 * Math.sin(v * 2 + 4));
+    }
+  } else if (mode === 'paint') {
+    d.set(paint);
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const k = document.getElementById('bri').value / 100;
+  if (mode === 'test') {
+    // Raw LED order, ignores the map: LED #i white, the 10 before it fading
+    // red, every segment start green. Shows where the data actually goes.
+    out.fill(0);
+    let start = 0;
+    for (const seg of SEGMENTS) { out[start*3+1] = 255 * k; start += seg.rows * W; }
+    const i = +idx.value;
+    for (let j = 1; j <= 10 && i - j >= 0; j++) out[(i-j)*3] = 255 * k * (1 - j / 11);
+    out.fill(255 * k, i * 3, i * 3 + 3);
+    // Preview where the map thinks LED #i is
+    d.fill(0); setPixel(d, ledMap[i], 255, 255, 255); ctx.putImageData(img, 0, 0);
+  } else {
+    for (let i = 0; i < N; i++) {
+      const p = ledMap[i] * 4;
+      out[i*3] = d[p] * k; out[i*3+1] = d[p+1] * k; out[i*3+2] = d[p+2] * k;
+    }
+  }
+  sendFrame(out);
+}
+
+let last = 0;
+function loop(now) {
+  if (now - last > 33) { last = now; render(now / 1000); } // ~30 fps
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---- Paint input ----------------------------------------------------------
+function paintAt(e) {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / r.width * W), y = Math.floor((e.clientY - r.top) / r.height * H);
+  const hex = document.getElementById('color').value;
+  const c = [1, 3, 5].map(i => parseInt(hex.substr(i, 2), 16));
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const px = x + dx, py = y + dy;
+    if (px >= 0 && px < W && py >= 0 && py < H) setPixel(paint, py * W + px, ...c);
+  }
+}
+canvas.addEventListener('pointerdown', e => { if (mode !== 'paint') return; canvas.setPointerCapture(e.pointerId); paintAt(e); });
+canvas.addEventListener('pointermove', e => { if (mode === 'paint' && e.buttons) paintAt(e); });
+document.getElementById('clear').onclick = () => paint.fill(0);
+
+// ---- Mode buttons ---------------------------------------------------------
+const buttons = document.querySelectorAll('[data-mode]');
+function setMode(m) {
+  mode = m;
+  buttons.forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+  document.getElementById('testRow').style.display = m === 'test' ? '' : 'none';
+  document.getElementById('paintRow').style.display = m === 'paint' ? '' : 'none';
+}
+buttons.forEach(b => b.onclick = () => setMode(b.dataset.mode));
+setMode(mode);
+</script>
+</body>
+</html>
